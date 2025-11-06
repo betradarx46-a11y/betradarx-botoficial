@@ -1,0 +1,139 @@
+# bot_belivie.py
+import time
+import requests
+from datetime import datetime
+from telegram import Bot, ParseMode
+from telegram.error import TelegramError
+
+# --- CONFIGURAÇÃO ---
+API_FOOTBALL_KEY = "a3bac118b8387cd042c4baa31996c880"
+API_FOOTBALL_HOST = "https://v3.football.api-sports.io"
+TELEGRAM_TOKEN = "8166808873:AAFA9uDDezVzKtPqqjbzXc55LnSA6w9Zfl4"
+CHAT_ID = "SEU_CHAT_ID_AQUI"  # seu id (coloque como string)
+POLL_INTERVAL = 60  # segundos
+
+# Sensibilidade (ajuste)
+THRESHOLD_TOTAL = 70
+THRESHOLD_DIFF = 15
+ESCANTEIOS_10MIN = 3
+
+bot = Bot(token=TELEGRAM_TOKEN)
+headers = {"x-apisports-key": API_FOOTBALL_KEY}
+
+# Helper: obter partidas em andamento
+def get_live_fixtures():
+    url = f"{API_FOOTBALL_HOST}/fixtures?live=all"
+    r = requests.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        print("Erro API-Football:", r.status_code, r.text[:200])
+        return []
+    data = r.json()
+    return data.get("response", [])
+
+# Helper: pegar estatísticas de jogo (events / statistics)
+def get_fixture_stats(fixture_id):
+    url = f"{API_FOOTBALL_HOST}/fixtures/statistics?fixture={fixture_id}"
+    r = requests.get(url, headers=headers, timeout=15)
+    if r.status_code != 200:
+        return None
+    return r.json().get("response", [])
+
+# Calcula pressão
+def calc_press(stats):
+    # stats: list of dicts por equipe conforme API
+    # vamos extrair 'Attacks', 'Shots on Goal', 'Corner' etc. conforme retorno
+    # API-Football may have 'shots.on' 'attacks' etc; adapt accordingly
+    try:
+        home = stats[0]  # depende do formato
+        away = stats[1]
+    except Exception:
+        return None, None, None
+
+    def val(team, key):
+        for item in team.get("statistics", []):
+            if item.get("type", "").lower() == key.lower():
+                return int(item.get("value") or 0)
+        return 0
+
+    # Ajuste as chaves se sua API devolver nomes diferentes
+    ataques_home = val(home, "Attacks")
+    ataques_away = val(away, "Attacks")
+    shots_home = val(home, "Shots on Goal")
+    shots_away = val(away, "Shots on Goal")
+    corners_home = val(home, "Corner")
+    corners_away = val(away, "Corner")
+
+    press_home = (ataques_home * 0.5) + (shots_home * 1.5) + (corners_home * 0.8)
+    press_away = (ataques_away * 0.5) + (shots_away * 1.5) + (corners_away * 0.8)
+    press_total = press_home + press_away
+    return press_home, press_away, press_total, {
+        "ataques_home": ataques_home, "ataques_away": ataques_away,
+        "shots_home": shots_home, "shots_away": shots_away,
+        "corners_home": corners_home, "corners_away": corners_away
+    }
+
+# Decide alertas
+def decide_alert(minute, press_home, press_away, press_total, aux):
+    diff = abs(press_home - press_away)
+    chutes_no_gol = aux["shots_home"] + aux["shots_away"]
+    esc_10min = aux["corners_home"] + aux["corners_away"]  # simplificação
+    # Regras agressivas (ajuste conforme desejar)
+    gol_prob = "Baixa"
+    if press_total >= THRESHOLD_TOTAL or (diff >= THRESHOLD_DIFF and chutes_no_gol >= 2):
+        gol_prob = "Alta"
+    elif press_total >= (THRESHOLD_TOTAL * 0.7):
+        gol_prob = "Média"
+    esc_alert = "Sim" if esc_10min >= ESCANTEIOS_10MIN else "Não"
+    return gol_prob, esc_alert, diff
+
+# Envia mensagem formatada
+def send_telegram(text):
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        print("Erro Telegram:", e)
+
+# Formata mensagem por partida
+def format_message(fix, minute, team_home, team_away, press_home, press_away, press_total, aux, gol_prob, esc_alert, diff):
+    t = f"<b>⚽ {team_home} {fix['goals']['home']} x {fix['goals']['away']} {team_away}</b>\n"
+    t += f"⏱️ {minute}' — Pressão: {int(press_total)} (Casa {int(press_home)} / Fora {int(press_away)})\n"
+    t += f"🔢 Chutes no gol: {aux['shots_home']} / {aux['shots_away']}  | Escanteios: {aux['corners_home']} / {aux['corners_away']}\n"
+    t += f"🎯 Prob. de gol próximo: <b>{gol_prob}</b>\n"
+    t += f"⚽ Sugerido: {'Over 0.5' if gol_prob=='Alta' else 'Aguardar'}  | Escanteios corrida? {esc_alert}\n"
+    t += f"📊 Diferença de pressão: {int(diff)}\n"
+    t += f"🔗 Fixture ID: {fix['fixture']['id']}"
+    return t
+
+# Loop principal
+def main_loop():
+    print("Bot Belivie iniciado:", datetime.now())
+    while True:
+        try:
+            fixtures = get_live_fixtures()
+            if not fixtures:
+                print("Sem jogos ao vivo agora.")
+            for f in fixtures:
+                fixture_id = f["fixture"]["id"]
+                minute_info = f.get("fixture", {}).get("status", {}).get("elapsed") or 0
+                teams = f.get("teams", {})
+                home = teams.get("home", {}).get("name", "Casa")
+                away = teams.get("away", {}).get("name", "Fora")
+                # pegar estatísticas detalhadas
+                stats = get_fixture_stats(fixture_id)
+                if not stats:
+                    continue
+                press_home, press_away, press_total, aux = calc_press(stats)
+                if press_total is None:
+                    continue
+                gol_prob, esc_alert, diff = decide_alert(minute_info, press_home, press_away, press_total, aux)
+                # regra: só enviar se gol_prob for Alta
+                if gol_prob == "Alta":
+                    msg = format_message(f, minute_info, home, away, press_home, press_away, press_total, aux, gol_prob, esc_alert, diff)
+                    send_telegram(msg)
+            time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            print("Erro no loop:", e)
+            time.sleep(30)
+
+if __name__ == "__main__":
+    main_loop()
